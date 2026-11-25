@@ -10,13 +10,8 @@ import lime.media.miniaudio.MAHelpers;
 import lime.utils.Bytes;
 import lime.utils.Float32Array;
 #elseif (js && html5 && lime_howlerjs)
-import js.html.audio.AnalyserNode;
-import js.html.audio.AudioBufferSourceNode;
-import js.html.audio.GainNode;
+import lime.media.AudioProcessBuffer;
 import js.lib.Float32Array;
-
-import lime.media.howlerjs.Howl;
-import lime.media.howlerjs.Howler;
 #end
 
 /** Analyzes the audio of an `AudioSource` and turns it into spectrum bars. */
@@ -104,13 +99,22 @@ class SpectralAnalyzer
 	private var writeIndex:Int = 0;
 	#elseif (js && html5 && lime_howlerjs)
 	@:noCompletion
-	private var howl:Howl;
+	private var sampleRing:Vector<Float>;
 
 	@:noCompletion
-	private var analyzer:AnalyserNode;
+	private var channelBuffers:Array<Float32Array> = [];
 
 	@:noCompletion
-	private var timeBuffer:Float32Array;
+	private var writeIndex:Int = 0;
+
+	@:noCompletion
+	private var sampleCount:Int = 0;
+
+	@:noCompletion
+	private var samplesDirty:Bool = false;
+
+	@:noCompletion
+	private var audioProcessListener:AudioProcessBuffer->Void;
 	#end
 
 	/**
@@ -138,23 +142,20 @@ class SpectralAnalyzer
 		barHistories = [];
 
 		#if (js && html5 && lime_howlerjs)
-		howl = @:privateAccess audioSource.buffer.__srcHowl;
-
-		sampleRate = Howler.ctx.sampleRate;
-
-		analyzer = new AnalyserNode(Howler.ctx);
-
-		if (audioSource.playing)
+		if (audioSource.buffer.sampleRate > 0)
 		{
-			connectAnalyzer();
+			sampleRate = audioSource.buffer.sampleRate;
 		}
-
-		howl.on("play", connectAnalyzer);
 		#end
 
 		rebuild();
 
 		calcBars(barCount);
+
+		#if (js && html5 && lime_howlerjs)
+		audioProcessListener = onAudioProcess;
+		audioSource.addAudioProcessListener(audioProcessListener);
+		#end
 	}
 
 	/**
@@ -181,18 +182,14 @@ class SpectralAnalyzer
 
 		readBuffer = null;
 		#elseif (js && html5 && lime_howlerjs)
-		if (howl != null)
+		if (audioProcessListener != null)
 		{
-			howl.off("play", connectAnalyzer);
+			audioSource.removeAudioProcessListener(audioProcessListener);
+			audioProcessListener = null;
 		}
 
-		if (analyzer != null)
-		{
-			analyzer.disconnect();
-			analyzer = null;
-		}
-
-		timeBuffer = null;
+		sampleRing = null;
+		channelBuffers = [];
 		#end
 	}
 
@@ -205,7 +202,7 @@ class SpectralAnalyzer
 			return levels;
 		}
 		#elseif (js && html5 && lime_howlerjs)
-		if (analyzer == null)
+		if (sampleRing == null)
 		{
 			return levels;
 		}
@@ -293,30 +290,40 @@ class SpectralAnalyzer
 
 		spectrumStale = true;
 		#elseif (js && html5 && lime_howlerjs)
-		if (!audioSource.playing)
+		if (!samplesDirty || sampleCount == 0)
 		{
-			if (holdLevels || silenced)
+			if (!audioSource.playing && !holdLevels && !silenced)
 			{
-				return;
+				clearSamples();
 			}
-
-			clearSamples();
 
 			return;
 		}
 
-		silenced = false;
-
-		analyzer.getFloatTimeDomainData(timeBuffer);
-
-		final src:Float32Array = timeBuffer;
-		final dst:Vector<Float> = samples;
-
-		for (i in 0...fftN)
+		if (sampleCount < fftN)
 		{
-			dst[i] = src[i];
+			for (i in 0...fftN)
+			{
+				samples[i] = 0;
+			}
+
+			final destinationOffset:Int = fftN - sampleCount;
+			final sourceStart:Int = (writeIndex - sampleCount + fftN) % fftN;
+
+			for (i in 0...sampleCount)
+			{
+				samples[destinationOffset + i] = sampleRing[(sourceStart + i) % fftN];
+			}
+		}
+		else
+		{
+			final tail:Int = fftN - writeIndex;
+			Vector.blit(sampleRing, writeIndex, samples, 0, tail);
+			Vector.blit(sampleRing, 0, samples, tail, writeIndex);
 		}
 
+		samplesDirty = false;
+		silenced = false;
 		spectrumStale = true;
 		#end
 	}
@@ -335,7 +342,12 @@ class SpectralAnalyzer
 		for (i in 0...fftN)
 		{
 			samples[i] = 0;
+			sampleRing[i] = 0;
 		}
+
+		writeIndex = 0;
+		sampleCount = 0;
+		samplesDirty = false;
 		#end
 
 		silenced = true;
@@ -353,8 +365,11 @@ class SpectralAnalyzer
 		#if (lime_cffi && lime_miniaudio && !macro)
 		createRingBuffer();
 		#elseif (js && html5 && lime_howlerjs)
-		analyzer.fftSize = fftN;
-		timeBuffer = new Float32Array(fftN);
+		sampleRing = new Vector<Float>(fftN, 0);
+		writeIndex = 0;
+		sampleCount = 0;
+		samplesDirty = false;
+		channelBuffers = [];
 		#end
 	}
 
@@ -469,31 +484,86 @@ class SpectralAnalyzer
 	}
 	#elseif (js && html5 && lime_howlerjs)
 	@:noCompletion
-	private function connectAnalyzer():Void
+	private function onAudioProcess(buffer:AudioProcessBuffer):Void
 	{
-		if (analyzer != null)
+		final channels:Int = buffer.numberOfChannels;
+		final frames:Int = buffer.length;
+
+		if (channels <= 0 || frames <= 0)
 		{
-			final sound:Dynamic = untyped howl._soundById(audioSource.__backend.handle);
+			return;
+		}
 
-			if (sound != null && sound._node != null)
+		sampleRate = buffer.sampleRate;
+
+		while (channelBuffers.length < channels)
+		{
+			channelBuffers.push(null);
+		}
+
+		for (channel in 0...channels)
+		{
+			channelBuffers[channel] = buffer.getChannelData(channel);
+		}
+
+		final ring:Vector<Float> = sampleRing;
+		final size:Int = fftN;
+		var write:Int = writeIndex;
+		var count:Int = sampleCount;
+
+		if (channels == 2)
+		{
+			final left:Float32Array = channelBuffers[0];
+			final right:Float32Array = channelBuffers[1];
+
+			for (frame in 0...frames)
 			{
-				final gainNode:GainNode = untyped sound._node;
+				ring[write] = (left[frame] + right[frame]) * 0.5;
 
-				if (gainNode != null)
-				{
-					final bufferSource:AudioBufferSourceNode = untyped gainNode.bufferSource;
-
-					if (bufferSource != null)
-					{
-						bufferSource.connect(analyzer);
-					}
-					else
-					{
-						gainNode.connect(analyzer);
-					}
-				}
+				if (++write == size)
+					write = 0;
+				if (count < size)
+					count++;
 			}
 		}
+		else if (channels == 1)
+		{
+			final mono:Float32Array = channelBuffers[0];
+
+			for (frame in 0...frames)
+			{
+				ring[write] = mono[frame];
+
+				if (++write == size)
+					write = 0;
+				if (count < size)
+					count++;
+			}
+		}
+		else
+		{
+			for (frame in 0...frames)
+			{
+				var sample:Float = 0;
+
+				for (channel in 0...channels)
+				{
+					sample += channelBuffers[channel][frame];
+				}
+
+				ring[write] = sample / channels;
+
+				if (++write == size)
+					write = 0;
+				if (count < size)
+					count++;
+			}
+		}
+
+		writeIndex = write;
+		sampleCount = count;
+		samplesDirty = true;
+		silenced = false;
 	}
 	#end
 
